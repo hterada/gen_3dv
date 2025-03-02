@@ -1,0 +1,25 @@
+# version: "3.9"  # Composeファイルのバージョン (Docker Engineのバージョンに合わせて調整)
+
+services:
+  vslam:  # サービス名 (任意)
+    build:
+      context: .  # Dockerfileがあるディレクトリ
+      dockerfile: Dockerfile  # Dockerfileのファイル名 (デフォルトはDockerfile)
+    image: vslam-test:latest # ビルドするイメージ名とタグ (任意)
+    tty: true
+    network_mode: host  # ホストネットワークを使用
+    shm_size: 8gb
+    volumes:
+      - .:/app  # ホストのカレントディレクトリをコンテナの/appにマウント
+    # command: python vslam_test.py  # (オプション) DockerfileのCMDを上書きする場合
+    # environment:  # (オプション) 環境変数を設定する場合
+    #   - VARIABLE_NAME=value
+    # ports:      #(オプション) ポートフォワーディング
+    #  - "8080:80"
+    # deploy:     # (オプション, Docker Swarm用) リソース制限やデプロイ設定
+    #   resources:
+    #     limits:
+    #       cpus: '0.5'
+    #       memory: 512M
+    #   restart_policy:
+    #     condition: on-failure
