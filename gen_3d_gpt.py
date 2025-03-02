@@ -5,8 +5,7 @@ import trimesh
 import pyrender
 from PIL import Image
 
-import pyglet
-
+#import pyglet
 #pyglet.options['shadow_window'] = False
 #window = pyglet.window.Window(visible=False)
 
@@ -22,13 +21,13 @@ def look_at(camera_position, target, up):
     camera_position = np.array(camera_position, dtype=np.float32)
     target = np.array(target, dtype=np.float32)
     up = np.array(up, dtype=np.float32)
-    
+
     forward = target - camera_position
     forward /= np.linalg.norm(forward)
     right = np.cross(forward, up)
     right /= np.linalg.norm(right)
     true_up = np.cross(right, forward)
-    
+
     # カメラは -Z 軸方向を撮影方向とするため、forward の符号を反転する
     R = np.eye(4, dtype=np.float32)
     R[:3, 0] = right
@@ -209,11 +208,30 @@ def main():
         scene.add(m)
 
     # シーンにライトを追加（シンプルな方向性ライト）
-    light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=3.0)
+    light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=10.0)
     # ライトノードは、例えばシーンの上部から照らす
     light_pose = np.eye(4)
     light_pose[:3, 3] = np.array([4, 4, 4])
     scene.add(light, pose=light_pose)
+
+    # 追加のライト
+    light2 = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=10.0)
+    light_pose2 = np.eye(4)
+    light_pose2[:3,3] = np.array([-4, 4, 4])
+    scene.add(light2, pose=light_pose2)
+
+    # 斜め上からのライトを追加（look_at関数を利用して、ライトの -Z 軸が原点を向くように設定）
+    diagonal_light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=5.0)
+    # ここではライトの位置として、斜め上（例: x=-4, y=8, z=-4）から原点を見るように設定
+    light_pose_diag = look_at(camera_position=[-4, 8, -4], target=[0, 0, 0], up=[0, 1, 0])
+    scene.add(diagonal_light, pose=light_pose_diag)
+
+    # 点光源を作成（色は白、強度は適宜調整）
+    point_light = pyrender.PointLight(color=[1.0, 1.0, 1.0], intensity=100.0)
+    # 点光源の位置を設定（例: シーンの上方かつやや横に配置）
+    point_light_pose = np.eye(4)
+    point_light_pose[:3, 3] = np.array([3, 5, 3])  # ここで座標を変更可能
+    scene.add(point_light, pose=point_light_pose)
 
     # オフスクリーンレンダラーの作成（例: 640x480）
     viewport_width = 640
