@@ -10,8 +10,9 @@ WORKDIR /app
 # libgl1: OpenGL関連 (Pillowが画像処理で必要とする場合がある)
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libgl1-mesa-glx \
-    && rm -rf /var/lib/apt/lists/*  # 不要なファイルを削除してイメージサイズを削減
+    libgl1-mesa-glx
+
+RUN apt-get install -y libgl1-mesa-dev
 
 # 必要なPythonライブラリをインストール
 # COPY requirements.txt ./
@@ -23,7 +24,7 @@ RUN cd pyglet && pip install .
 
 
 RUN pip install numpy Pillow pyquaternion imageio
-RUN pip install trimesh pyrender
+RUN pip install trimesh pyrender glfw PyOpenGL
 
 # スクリプトをコピー
 # COPY vslam_test.py .
@@ -31,6 +32,9 @@ RUN pip install trimesh pyrender
 # テクスチャファイルをコピーする場所を作成 (オプション)
 # テクスチャファイルを使用する場合は、このディレクトリにコピーする
 #RUN mkdir textures
+
+# 最後に不要なファイルを削除してイメージサイズを削減
+RUN rm -rf /var/lib/apt/lists/*
 
 # 実行コマンド (コンテナ起動時に実行される)
 # CMD ["python", "vslam_test.py"]
