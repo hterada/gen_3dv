@@ -12,7 +12,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1-mesa-glx
 
-RUN apt-get install -y libgl1-mesa-dev
+RUN apt-get update -y
+RUN apt-get install -y libgl1-mesa-dev mesa-utils
 
 # 必要なPythonライブラリをインストール
 # COPY requirements.txt ./
