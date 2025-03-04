@@ -20,8 +20,7 @@ RUN apt-get install -y libgl1-mesa-dev mesa-utils
 # RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get update -y
 RUN apt-get install -y git
-RUN git clone https://github.com/mmatl/pyglet.git 
-RUN cd pyglet && pip install .
+RUN pip install -U --user pyglet
 
 
 RUN pip install numpy Pillow pyquaternion imageio
