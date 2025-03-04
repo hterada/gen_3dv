@@ -17,7 +17,7 @@ services:
       - ~/.Xauthority:/root/.Xauthority:rw
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
-      - DISPLAY=":1" #VNCServer
+      - DISPLAY=:1 #VNCServer
       - LIBGL_ALWAYS_INDIRECT=0
     # host gpu を使えるようにする設定　https://docs.docker.jp/compose/gpu-support.html
     deploy:
