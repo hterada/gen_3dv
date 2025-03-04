@@ -6,7 +6,7 @@ services:
       context: .  # Dockerfileがあるディレクトリ
       dockerfile: Dockerfile  # Dockerfileのファイル名 (デフォルトはDockerfile)
     container_name: gen_3dv-container
-    image: vslam-test:latest # ビルドするイメージ名とタグ (任意)
+    image: gen_3dv:latest # ビルドするイメージ名とタグ (任意)
     tty: true
     network_mode: host  # ホストネットワークを使用
     shm_size: 8gb
@@ -17,4 +17,13 @@ services:
       - ~/.Xauthority:/root/.Xauthority:rw
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
-      - DISPLAY=${DISPLAY}
+      - DISPLAY=":1" #VNCServer
+      - LIBGL_ALWAYS_INDIRECT=0
+    # host gpu を使えるようにする設定　https://docs.docker.jp/compose/gpu-support.html
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
