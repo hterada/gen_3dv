@@ -275,8 +275,11 @@ def main():
         color = color[:, :, :3]
 
         # 画像を保存
+        relative_path="rgb"
+        os.makedirs(f"{out_dir}/{relative_path}", exist_ok=True)
+        
         img_filename = f"frame_{i:04d}.png"
-        img_path = os.path.join(out_dir, img_filename)
+        img_path = os.path.join(f"{out_dir}/{relative_path}", img_filename)
         Image.fromarray(color).save(img_path)
 
         # カメラ姿勢を TUM 形式（timestamp tx ty tz qx qy qz qw）で記録
@@ -285,9 +288,13 @@ def main():
         R_cam = cam_pose[:3, :3]
         quat = rotation_matrix_to_quaternion(R_cam)
         t = cam_pose[:3, 3]
+        
+        # groundtruth.txt に記録（timestamp と姿勢）
         gt_line = f"{timestamp:.6f} {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} {quat[0]:.6f} {quat[1]:.6f} {quat[2]:.6f} {quat[3]:.6f}"
         gt_lines.append(gt_line)
-        rgb_line = f"{timestamp:.6f} {img_filename}"
+        
+        # rgb.txt に記録（timestamp とファイル名）
+        rgb_line = f"{timestamp:.6f} {relative_path}/{img_filename}"
         rgb_lines.append(rgb_line)
 
         print(f"Frame {i+1}/{num_frames} rendered.")
