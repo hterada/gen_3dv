@@ -240,6 +240,25 @@ def main():
 
     # カメラの設定（画角など）
     camera = pyrender.PerspectiveCamera(yfov=np.deg2rad(50.0))
+    
+    # カメラの内部パラメータを取り出す
+    proj_matrix = camera.get_projection_matrix(width=viewport_width, height=viewport_height)
+    print("カメラの射影行列:")
+    print(proj_matrix)
+    
+    # 射影行列から内部パラメータを計算
+    fx = proj_matrix[0, 0] * viewport_width / 2.0
+    fy = proj_matrix[1, 1] * viewport_height / 2.0
+    cx = viewport_width / 2.0
+    cy = viewport_height / 2.0
+    
+    print(f"\nカメラの内部パラメータ:")
+    print(f"焦点距離 fx: {fx:.2f}")
+    print(f"焦点距離 fy: {fy:.2f}")
+    print(f"主点 cx: {cx:.2f}")
+    print(f"主点 cy: {cy:.2f}")
+    
+    
     # 初期カメラ位置（仮の値）
     init_pose = np.eye(4)
     camera_node = scene.add(camera, pose=init_pose)
