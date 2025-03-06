@@ -314,6 +314,9 @@ class Renderer:
         # 深度バッファの初期化（遠い距離で初期化）
         depth_buffer = np.ones((self.height, self.width)) * self.far
         
+        # Z-バッファリングを適切に行うためのフラグ
+        use_strict_depth_test = True
+        
         # 円上のカメラ位置を計算
         radius = 3.0
         camera_x = radius * math.sin(angle)
@@ -382,71 +385,180 @@ class Renderer:
             # この面のテクスチャを取得
             texture = self.textures[face_idx]
             
-            # 簡易的な透視補正テクスチャマッピング
+            # キューブの面のワールド座標からテクスチャ座標への変換マトリックスを作成
+            # これにより正確な透視効果を実現
+            
+            # 面の頂点のワールド座標
+            world_vertices = [self.vertices[idx][:3] for idx in face]
+            
+            # テクスチャ座標 (UV座標)
+            texture_coords = np.array([
+                [0, 0],  # 左下
+                [1, 0],  # 右下
+                [1, 1],  # 右上
+                [0, 1]   # 左上
+            ])
+            
+            # 透視変換を考慮したテクスチャマッピング
             for y in range(self.height):
                 for x in range(self.width):
                     if mask[y, x] == 0:
                         continue
                     
-                    # バリセントリック座標の計算
-                    # これは単純化されたアプローチで長方形を使用
-                    # 完全なレンダラーでは、適切なバリセントリック座標を使用する
+                    # スクリーン座標から正規化デバイス座標（NDC）に変換
+                    ndc_x = (x / self.width) * 2 - 1
+                    ndc_y = 1 - (y / self.height) * 2
                     
-                    # UV座標の簡易的なバイリニア補間
-                    min_x = min(c[0] for c in screen_coords)
-                    max_x = max(c[0] for c in screen_coords)
-                    min_y = min(c[1] for c in screen_coords)
-                    max_y = max(c[1] for c in screen_coords)
+                    # レイ方向を計算（カメラ位置から現在のピクセルへ）
+                    # 逆射影行列を適用
+                    ray_clip = np.array([ndc_x, ndc_y, -1.0, 1.0])
+                    ray_eye = np.linalg.inv(self.projection_matrix) @ ray_clip
+                    ray_eye = np.array([ray_eye[0], ray_eye[1], -1.0, 0.0])
+                    ray_world = np.linalg.inv(view_matrix) @ ray_eye
+                    ray_world = ray_world[:3] / np.linalg.norm(ray_world[:3])
                     
-                    # ゼロ除算を回避
-                    width = max(1, max_x - min_x)
-                    height = max(1, max_y - min_y)
+                    # カメラの位置
+                    origin = camera_pos
                     
-                    # UV座標の計算
-                    u = (x - min_x) / width
-                    v = (y - min_y) / height
+                    # 面と光線の交点を計算
+                    # 簡易的なアプローチ: 3点から平面を定義し、光線との交点を計算
+                    p0 = np.array(world_vertices[0])
+                    p1 = np.array(world_vertices[1])
+                    p2 = np.array(world_vertices[2])
                     
-                    # 深度値の補間（簡易的）
-                    # 正確なレンダラーでは、バリセントリック座標を使用してZ値を補間する
-                    depth_sum = 0
-                    weight_sum = 0
+                    # 平面の法線ベクトルを計算
+                    normal = np.cross(p1 - p0, p2 - p0)
+                    normal = normal / np.linalg.norm(normal)
                     
-                    for idx in face:
-                        # スクリーン座標を取得
-                        sx = int((transformed_vertices[idx][0] + 1) * self.width / 2)
-                        sy = int((1 - transformed_vertices[idx][1]) * self.height / 2)
+                    # 平面と光線の交点を計算
+                    t = np.dot(p0 - origin, normal) / np.dot(ray_world, normal)
+                    
+                    # 光線が平面と交差しない場合はスキップ
+                    if t < 0:
+                        continue
+                    
+                    # 交点の座標
+                    intersection = origin + t * ray_world
+                    
+                    # 交点が面内にあるか確認
+                    # 簡易的なアプローチ: バリセントリック座標を使用
+                    # 2D射影を使用して単純化
+                    def is_point_in_triangle(p, v0, v1, v2):
+                        def sign(p1, p2, p3):
+                            return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
                         
-                        # 現在のピクセルとの距離
-                        dist = math.sqrt((x - sx) ** 2 + (y - sy) ** 2) + 0.0001  # ゼロ除算回避
-                        weight = 1 / dist
+                        d1 = sign(p, v0, v1)
+                        d2 = sign(p, v1, v2)
+                        d3 = sign(p, v2, v0)
                         
-                        # カメラ空間でのZ値（負の値）
-                        z_value = -camera_space_vertices[idx][2]
+                        has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+                        has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
                         
-                        depth_sum += z_value * weight
-                        weight_sum += weight
+                        return not (has_neg and has_pos)
                     
-                    # 補間された深度値
-                    interpolated_depth = depth_sum / weight_sum
+                    # 面を2つの三角形に分割
+                    triangles = [
+                        [world_vertices[0], world_vertices[1], world_vertices[2]],
+                        [world_vertices[0], world_vertices[2], world_vertices[3]]
+                    ]
+                    triangle_uvs = [
+                        [texture_coords[0], texture_coords[1], texture_coords[2]],
+                        [texture_coords[0], texture_coords[2], texture_coords[3]]
+                    ]
+                    
+                    # 交点のバリセントリック座標を計算
+                    def barycentric(p, v0, v1, v2):
+                        v0v1 = v1 - v0
+                        v0v2 = v2 - v0
+                        pvv0 = p - v0
+                        
+                        d00 = np.dot(v0v1, v0v1)
+                        d01 = np.dot(v0v1, v0v2)
+                        d11 = np.dot(v0v2, v0v2)
+                        d20 = np.dot(pvv0, v0v1)
+                        d21 = np.dot(pvv0, v0v2)
+                        
+                        denom = d00 * d11 - d01 * d01
+                        if abs(denom) < 1e-6:
+                            return -1, -1, -1
+                            
+                        v = (d11 * d20 - d01 * d21) / denom
+                        w = (d00 * d21 - d01 * d20) / denom
+                        u = 1.0 - v - w
+                        
+                        return u, v, w
+                    
+                    # 正確な深度計算のために、カメラ空間での交点を計算
+                    point_depth = t
+                    
+                    # すでに描画されたピクセルよりも手前にあるか確認
+                    if point_depth >= depth_buffer[y, x]:
+                        continue
+                    
+                    # 交点がどの三角形内にあるか、そしてUV座標を計算
+                    found = False
+                    u, v = 0, 0
+                    
+                    for tri_idx, (triangle, tri_uv) in enumerate(zip(triangles, triangle_uvs)):
+                        # 3Dバリセントリック座標を計算
+                        bc_u, bc_v, bc_w = barycentric(intersection, triangle[0], triangle[1], triangle[2])
+                        
+                        if bc_u >= 0 and bc_v >= 0 and bc_w >= 0:
+                            # バリセントリック座標を使ってUV座標を補間
+                            u = bc_u * tri_uv[0][0] + bc_v * tri_uv[1][0] + bc_w * tri_uv[2][0]
+                            v = bc_u * tri_uv[0][1] + bc_v * tri_uv[1][1] + bc_w * tri_uv[2][1]
+                            found = True
+                            break
+                    
+                    if not found:
+                        # 平面内だが三角形内にない場合は、単純にUV座標を計算
+                        # これは通常発生すべきではないが、数値誤差による対策
+                        p0 = np.array(world_vertices[0])
+                        p1 = np.array(world_vertices[1])
+                        p3 = np.array(world_vertices[3])
+                        
+                        # 面の座標系内での交点の位置を計算
+                        v0 = p1 - p0  # 幅方向
+                        v1 = p3 - p0  # 高さ方向
+                        
+                        # p0からの相対位置を計算
+                        rel_pos = intersection - p0
+                        
+                        # 相対位置をv0, v1の基底で表現
+                        # これは近似的な計算で、より正確にはグラム・シュミット過程などを使用
+                        proj_u = np.dot(rel_pos, v0) / np.dot(v0, v0)
+                        proj_v = np.dot(rel_pos, v1) / np.dot(v1, v1)
+                        
+                        u = max(0, min(1, proj_u))
+                        v = max(0, min(1, proj_v))
+                    
+                    # テクスチャの色を取得
+                    tx = min(int(u * texture.shape[1]), texture.shape[1] - 1)
+                    ty = min(int(v * texture.shape[0]), texture.shape[0] - 1)
+                    
+                    color = texture[ty, tx]
                     
                     # 深度テストと更新
-                    if interpolated_depth < depth_buffer[y, x]:
-                        # テクスチャの色を取得
-                        tx = min(int(u * texture.shape[1]), texture.shape[1] - 1)
-                        ty = min(int(v * texture.shape[0]), texture.shape[0] - 1)
-                        
-                        frame[y, x] = texture[ty, tx]
-                        depth_buffer[y, x] = interpolated_depth
+                    if point_depth < depth_buffer[y, x]:
+                        frame[y, x] = color
+                        depth_buffer[y, x] = point_depth
         
         # 深度マップを0-1の範囲に正規化
         normalized_depth = np.zeros_like(depth_buffer)
-        depth_min = np.min(depth_buffer[depth_buffer < self.far])
-        depth_max = np.max(depth_buffer[depth_buffer < self.far])
         
-        # 背景（最大深度の値）を処理
-        mask = depth_buffer < self.far
-        if np.any(mask):  # マスクが空でないことを確認
-            normalized_depth[mask] = (depth_buffer[mask] - depth_min) / (depth_max - depth_min)
+        # 物体が描画されたピクセルのみを考慮
+        valid_depths = depth_buffer[depth_buffer < self.far]
+        
+        if len(valid_depths) > 0:  # 有効な深度値が存在する場合
+            depth_min = np.min(valid_depths)
+            depth_max = np.max(valid_depths)
+            
+            # 最小値と最大値が同じ場合の対策
+            depth_range = max(depth_max - depth_min, 0.001)
+            
+            # 背景（最大深度の値）を処理
+            mask = depth_buffer < self.far
+            normalized_depth[mask] = (depth_buffer[mask] - depth_min) / depth_range
         
         # 背景を最大深度に設定（背景は無限遠）
         normalized_depth[depth_buffer >= self.far] = 1.0
