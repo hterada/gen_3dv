@@ -4,6 +4,8 @@ import os
 import math
 from PIL import Image, ImageDraw
 import datetime
+import torch
+import time
 
 
 class TUMFormatWriter:
@@ -63,7 +65,7 @@ class TUMFormatWriter:
         
         Parameters:
         frame (numpy.ndarray): 出力するRGB画像データ
-        depth_map (numpy.ndarray): 出力する深度画像データ
+        depth_map (numpy.ndarray): 出力する深度画像データ (メートル単位)
         frame_idx (int): フレームインデックス
         camera_pos (numpy.ndarray): カメラの位置 [x, y, z]
         camera_quaternion (numpy.ndarray): カメラの姿勢を表す四元数 [qx, qy, qz, qw]
@@ -84,8 +86,8 @@ class TUMFormatWriter:
         depth_path = os.path.join(self.depth_dir, depth_filename)
         
         # 深度マップをスケーリングして保存（TUMフォーマットに合わせて調整）
-        # TUMフォーマット: 深度値は16ビット画像で、単位はm(メートル)の1000倍
-        scaled_depth = (depth_map * 1000).astype(np.uint16)
+        # SLAMテスト用にスケールを5000に設定（メートル単位の5000倍 → ミリメートル単位の5倍）
+        scaled_depth = (depth_map * 5000).astype(np.uint16)
         cv2.imwrite(depth_path, scaled_depth)
         
         # rgb.txtファイルへの書き込み
@@ -106,14 +108,31 @@ class TUMFormatWriter:
         return timestamp
 
 
-class Renderer:
-    def __init__(self, width=640, height=480, fov=60):
+class GPURenderer:
+    def __init__(self, width=640, height=480, fov=60, device=None):
+        """
+        初期化関数
+        
+        Parameters:
+        width (int): 画像の幅
+        height (int): 画像の高さ
+        fov (float): 視野角（度）
+        device (torch.device, optional): 使用するデバイス。指定がなければGPUが利用可能なら使用
+        """
         self.width = width
         self.height = height
         self.fov = fov
         self.aspect_ratio = width / height
         self.near = 0.1
         self.far = 100
+        
+        # デバイスの設定
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+        
+        print(f"PyTorchで使用するデバイス: {self.device}")
         
         # カメラの内部パラメータを計算
         self.focal_length = self.width / (2 * math.tan(math.radians(self.fov / 2)))
@@ -131,6 +150,22 @@ class Renderer:
         # キューブのテクスチャを作成
         self.create_cube_textures()
         
+        # ピクセル座標のメッシュグリッドを事前計算（GPU上）
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(self.height, device=self.device),
+            torch.arange(self.width, device=self.device),
+            indexing='ij'
+        )
+        
+        self.pixel_coords = torch.stack([
+            (x_coords.float() / self.width) * 2 - 1,        # NDC x座標
+            1 - (y_coords.float() / self.height) * 2,       # NDC y座標
+            -torch.ones_like(x_coords, device=self.device)  # NDC z座標（常に-1）
+        ], dim=-1)
+        
+        # NDC座標からレイ方向への変換に使用する逆射影行列
+        self.inv_projection = torch.inverse(torch.tensor(self.projection_matrix, device=self.device))
+    
     def _print_camera_intrinsics(self):
         """カメラの内部パラメータを表示"""
         print("カメラ内部パラメータ:")
@@ -155,7 +190,7 @@ class Renderer:
             [0, f, 0, 0],
             [0, 0, (self.far + self.near) / (self.near - self.far), (2 * self.far * self.near) / (self.near - self.far)],
             [0, 0, -1, 0]
-        ])
+        ], dtype=np.float32)
     
     def create_cube_textures(self):
         """キューブの各面に異なるテクスチャを作成"""
@@ -169,7 +204,10 @@ class Renderer:
             [0.5, -0.5, 0.5, 1.0],    # 5
             [0.5, 0.5, 0.5, 1.0],     # 6
             [-0.5, 0.5, 0.5, 1.0]     # 7
-        ])
+        ], dtype=np.float32)
+        
+        # GPU用に変換
+        self.vertices_gpu = torch.tensor(self.vertices, device=self.device)
         
         # 面（各面は4つの頂点で構成、反時計回りに指定）
         self.faces = [
@@ -181,16 +219,31 @@ class Renderer:
             [1, 0, 4, 5]   # 底面
         ]
         
+        # 三角形に分割した面のインデックス（GPU上での計算用）
+        self.triangles = []
+        self.triangle_face_mapping = []  # 各三角形がどの面に属するかのマッピング
+        
+        for face_idx, face in enumerate(self.faces):
+            # 面を2つの三角形に分割
+            self.triangles.append([face[0], face[1], face[2]])  # 三角形1
+            self.triangles.append([face[0], face[2], face[3]])  # 三角形2
+            self.triangle_face_mapping.extend([face_idx, face_idx])
+        
+        # GPU用に変換
+        self.triangles_gpu = torch.tensor(self.triangles, device=self.device)
+        self.triangle_face_mapping_gpu = torch.tensor(self.triangle_face_mapping, device=self.device)
+        
         # テクスチャマッピング用のUV座標
         self.uvs = np.array([
-            [0, 0],
-            [1, 0],
-            [1, 1],
-            [0, 1]
-        ])
+            [0, 0],  # 左下
+            [1, 0],  # 右下
+            [1, 1],  # 右上
+            [0, 1]   # 左上
+        ], dtype=np.float32)
         
         # 各面に異なるテクスチャを作成（異なる色の市松模様）
         self.textures = []
+        self.textures_gpu = []
         colors = [
             ((255, 0, 0), (200, 0, 0)),       # 赤
             ((0, 255, 0), (0, 200, 0)),       # 緑
@@ -203,6 +256,9 @@ class Renderer:
         for color1, color2 in colors:
             texture = self._create_checkboard_texture(128, 128, color1, color2)
             self.textures.append(texture)
+            # NumPy配列をPyTorchテンソルに変換
+            texture_gpu = torch.tensor(texture, device=self.device).float() / 255.0
+            self.textures_gpu.append(texture_gpu)
     
     def _create_checkboard_texture(self, width, height, color1, color2, squares=8):
         """指定サイズの市松模様テクスチャを作成"""
@@ -239,34 +295,6 @@ class Renderer:
         
         return np.array([qx, qy, qz, qw])
     
-    def get_rotation_matrix(self, roll, pitch, yaw):
-        """オイラー角から回転行列を作成"""
-        # ロール（X）、ピッチ（Y）、ヨー（Z）
-        # まず各軸の回転行列を作成
-        Rx = np.array([
-            [1, 0, 0, 0],
-            [0, math.cos(roll), -math.sin(roll), 0],
-            [0, math.sin(roll), math.cos(roll), 0],
-            [0, 0, 0, 1]
-        ])
-        
-        Ry = np.array([
-            [math.cos(pitch), 0, math.sin(pitch), 0],
-            [0, 1, 0, 0],
-            [-math.sin(pitch), 0, math.cos(pitch), 0],
-            [0, 0, 0, 1]
-        ])
-        
-        Rz = np.array([
-            [math.cos(yaw), -math.sin(yaw), 0, 0],
-            [math.sin(yaw), math.cos(yaw), 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ])
-        
-        # 回転を組み合わせる: R = Rz * Ry * Rx
-        return Rz @ Ry @ Rx
-    
     def get_view_matrix(self, camera_pos, target_pos, up_vector):
         """カメラ位置、ターゲット、上ベクトルからビュー行列を作成"""
         # カメラ座標系の作成
@@ -279,7 +307,7 @@ class Renderer:
         y_axis = np.cross(z_axis, x_axis)
         
         # ビュー行列の作成
-        view_matrix = np.eye(4)
+        view_matrix = np.eye(4, dtype=np.float32)
         view_matrix[0, :3] = x_axis
         view_matrix[1, :3] = y_axis
         view_matrix[2, :3] = z_axis
@@ -291,279 +319,214 @@ class Renderer:
         
         return view_matrix
     
-    def is_face_visible(self, transformed_vertices, face_indices):
-        """裏面カリングを用いて面がカメラから見えるかチェック"""
-        # 面から3つの頂点を取得
-        v0 = transformed_vertices[face_indices[0]]
-        v1 = transformed_vertices[face_indices[1]]
-        v2 = transformed_vertices[face_indices[2]]
-        
-        # 外積を使って面の法線を計算
-        edge1 = v1[:3] - v0[:3]
-        edge2 = v2[:3] - v0[:3]
-        normal = np.cross(edge1, edge2)
-        
-        # 法線がカメラ方向を向いているか確認（カメラ空間ではzが負）
-        return normal[2] < 0
-    
-    def render_scene(self, angle):
-        """キューブの周りを周回するカメラからシーンをレンダリング"""
-        # 白色背景の作成
-        frame = np.ones((self.height, self.width, 3), dtype=np.uint8) * 255
-        
-        # 深度バッファの初期化（遠い距離で初期化）
-        depth_buffer = np.ones((self.height, self.width)) * self.far
-        
-        # Z-バッファリングを適切に行うためのフラグ
-        use_strict_depth_test = True
+    def render_scene_gpu(self, angle):
+        """GPUを使用してキューブの周りを周回するカメラからシーンをレンダリング"""
+        # 処理時間の計測を開始
+        start_time = time.time()
         
         # 円上のカメラ位置を計算
         radius = 3.0
         camera_x = radius * math.sin(angle)
         camera_z = radius * math.cos(angle)
-        camera_pos = np.array([camera_x, 0, camera_z])
+        camera_pos = np.array([camera_x, 0, camera_z], dtype=np.float32)
         
         # 原点（キューブの位置）を注視
-        target_pos = np.array([0, 0, 0])
-        up_vector = np.array([0, 1, 0])
+        target_pos = np.array([0, 0, 0], dtype=np.float32)
+        up_vector = np.array([0, 1, 0], dtype=np.float32)
         
         # ビュー行列の作成
         view_matrix = self.get_view_matrix(camera_pos, target_pos, up_vector)
         
+        # GPU用に変換
+        view_matrix_gpu = torch.tensor(view_matrix, device=self.device)
+        inv_view_matrix_gpu = torch.inverse(view_matrix_gpu)
+        
         # カメラ回転の四元数表現を取得
-        # TUM形式のために、カメラからワールドへの変換をワールドからカメラへの変換に
-        # 原点を見ている(x,0,z)位置のカメラの場合、回転はY軸周りの回転
         camera_quaternion = self.quaternion_from_euler(0, -angle + math.pi, 0)
         
-        # 頂点をオブジェクト空間からカメラ空間に変換
-        transformed_vertices = np.zeros_like(self.vertices)
-        camera_space_vertices = np.zeros_like(self.vertices)
+        # 頂点をカメラ空間に変換
+        homogeneous_vertices = self.vertices_gpu.clone()
+        camera_space_vertices = torch.matmul(view_matrix_gpu, homogeneous_vertices.T).T
         
-        for i, vertex in enumerate(self.vertices):
-            # カメラ空間への変換
-            camera_vertex = view_matrix @ vertex
-            camera_space_vertices[i] = camera_vertex
-            
-            # 射影変換
-            transformed = self.projection_matrix @ camera_vertex
-            
-            # 透視除算
-            if transformed[3] != 0:
-                transformed = transformed / transformed[3]
-            
-            transformed_vertices[i] = transformed
+        # 白色背景のフレームと深度バッファを初期化
+        frame = torch.ones((self.height, self.width, 3), device=self.device)
+        depth_buffer = torch.ones((self.height, self.width), device=self.device) * self.far
         
-        # 深度による面のソート（簡易的なペインターアルゴリズム）
-        face_depths = []
-        for i, face in enumerate(self.faces):
-            # 面の平均Z深度を計算
-            z_depth = sum(transformed_vertices[idx][2] for idx in face) / 4
-            face_depths.append((i, z_depth))
+        # 全ピクセルのレイ方向を計算
+        # ray_clip: [height, width, 3]
+        ray_clip = self.pixel_coords.clone()
         
-        # 面を奥から手前にソート
-        face_depths.sort(key=lambda x: x[1], reverse=True)
+        # ray_clip を 4次元に拡張 [height, width, 4]
+        ray_clip = torch.cat([ray_clip, torch.ones((self.height, self.width, 1), device=self.device)], dim=-1)
         
-        # 各面をレンダリング
-        for face_idx, _ in face_depths:
-            face = self.faces[face_idx]
+        # ray_eye: [height, width, 4]
+        # 逆射影行列を適用
+        ray_eye = torch.matmul(self.inv_projection, ray_clip.reshape(-1, 4).T).T
+        ray_eye = ray_eye.reshape(self.height, self.width, 4)
+        ray_eye = torch.cat([
+            ray_eye[..., :2], 
+            -torch.ones((self.height, self.width, 1), device=self.device), 
+            torch.zeros((self.height, self.width, 1), device=self.device)
+        ], dim=-1)
+        
+        # ray_world: [height, width, 4]
+        # カメラ空間からワールド空間に変換
+        ray_world_full = torch.matmul(inv_view_matrix_gpu, ray_eye.reshape(-1, 4).T).T
+        ray_world_full = ray_world_full.reshape(self.height, self.width, 4)
+        
+        # 方向ベクトルのみを取り出す [height, width, 3]
+        ray_world = ray_world_full[..., :3]
+        
+        # 正規化
+        ray_world_norm = torch.nn.functional.normalize(ray_world, dim=-1)
+        
+        # カメラの位置を拡張 [height, width, 3]
+        origin = torch.tensor(camera_pos, device=self.device).expand(self.height, self.width, 3)
+        
+        # 面ごとに処理（近いものから遠いものへ）
+        for tri_idx in range(len(self.triangles)):
+            # 三角形の頂点インデックス
+            v_idx = self.triangles_gpu[tri_idx]
             
-            # カメラから見えない面はスキップ
-            if not self.is_face_visible(transformed_vertices, face):
+            # 三角形の3つの頂点
+            v0 = self.vertices_gpu[v_idx[0], :3]
+            v1 = self.vertices_gpu[v_idx[1], :3]
+            v2 = self.vertices_gpu[v_idx[2], :3]
+            
+            # 面の法線ベクトルを計算
+            normal = torch.cross(v1 - v0, v2 - v0)
+            normal = torch.nn.functional.normalize(normal, dim=0)
+            
+            # レイキャスティングによる交点計算
+            # (p0 - origin) · normal / (ray_dir · normal)
+            denom = torch.sum(ray_world_norm * normal, dim=-1)
+            
+            # ゼロ除算を回避（法線とレイが平行の場合）
+            mask_valid = torch.abs(denom) > 1e-6
+            
+            # 交点計算（t値）
+            t = torch.zeros((self.height, self.width), device=self.device)
+            
+            # 効率化：有効なピクセルだけで計算
+            if mask_valid.any():
+                p0_minus_origin = v0 - origin[0, 0]
+                numer = torch.sum(p0_minus_origin * normal, dim=-1)
+                t[mask_valid] = numer / denom[mask_valid]
+            
+            # 交点がカメラの前方にあるかどうか
+            mask_positive = t > 0
+            
+            # 深度テストのマスク
+            mask_depth = t < depth_buffer
+            
+            # 両方の条件を満たすピクセルだけを処理
+            mask_process = mask_valid & mask_positive & mask_depth
+            
+            if not mask_process.any():
                 continue
             
-            # 面の頂点のスクリーン座標を取得
-            screen_coords = []
-            for idx in face:
-                x = (transformed_vertices[idx][0] + 1) * self.width / 2
-                y = (1 - transformed_vertices[idx][1]) * self.height / 2
-                screen_coords.append((int(x), int(y)))
+            # 交点座標を計算
+            intersections = origin.clone()
+            intersections[mask_process] += ray_world_norm[mask_process] * t[mask_process].unsqueeze(-1)
             
-            # 面のマスクを作成
-            mask = np.zeros((self.height, self.width), dtype=np.uint8)
-            cv2.fillPoly(mask, [np.array(screen_coords)], 255)
+            # バリセントリック座標を計算
+            # 効率化：マスクを適用したテンソルで計算
+            masked_intersections = intersections[mask_process]
             
-            # この面のテクスチャを取得
-            texture = self.textures[face_idx]
+            # 三角形の頂点をGPUテンソルに変換
+            edge1 = v1 - v0
+            edge2 = v2 - v0
             
-            # キューブの面のワールド座標からテクスチャ座標への変換マトリックスを作成
-            # これにより正確な透視効果を実現
+            # マスク適用後の形状に合わせて拡張
+            v0_expanded = v0.expand(masked_intersections.shape[0], 3)
             
-            # 面の頂点のワールド座標
-            world_vertices = [self.vertices[idx][:3] for idx in face]
+            # バリセントリック座標の計算
+            vp = masked_intersections - v0_expanded
             
-            # テクスチャ座標 (UV座標)
-            texture_coords = np.array([
-                [0, 0],  # 左下
-                [1, 0],  # 右下
-                [1, 1],  # 右上
-                [0, 1]   # 左上
-            ])
+            # 各ベクトルの内積を計算
+            d00 = torch.sum(edge1 * edge1)
+            d01 = torch.sum(edge1 * edge2)
+            d11 = torch.sum(edge2 * edge2)
+            d20 = torch.sum(vp * edge1, dim=1)
+            d21 = torch.sum(vp * edge2, dim=1)
             
-            # 透視変換を考慮したテクスチャマッピング
-            for y in range(self.height):
-                for x in range(self.width):
-                    if mask[y, x] == 0:
-                        continue
-                    
-                    # スクリーン座標から正規化デバイス座標（NDC）に変換
-                    ndc_x = (x / self.width) * 2 - 1
-                    ndc_y = 1 - (y / self.height) * 2
-                    
-                    # レイ方向を計算（カメラ位置から現在のピクセルへ）
-                    # 逆射影行列を適用
-                    ray_clip = np.array([ndc_x, ndc_y, -1.0, 1.0])
-                    ray_eye = np.linalg.inv(self.projection_matrix) @ ray_clip
-                    ray_eye = np.array([ray_eye[0], ray_eye[1], -1.0, 0.0])
-                    ray_world = np.linalg.inv(view_matrix) @ ray_eye
-                    ray_world = ray_world[:3] / np.linalg.norm(ray_world[:3])
-                    
-                    # カメラの位置
-                    origin = camera_pos
-                    
-                    # 面と光線の交点を計算
-                    # 簡易的なアプローチ: 3点から平面を定義し、光線との交点を計算
-                    p0 = np.array(world_vertices[0])
-                    p1 = np.array(world_vertices[1])
-                    p2 = np.array(world_vertices[2])
-                    
-                    # 平面の法線ベクトルを計算
-                    normal = np.cross(p1 - p0, p2 - p0)
-                    normal = normal / np.linalg.norm(normal)
-                    
-                    # 平面と光線の交点を計算
-                    t = np.dot(p0 - origin, normal) / np.dot(ray_world, normal)
-                    
-                    # 光線が平面と交差しない場合はスキップ
-                    if t < 0:
-                        continue
-                    
-                    # 交点の座標
-                    intersection = origin + t * ray_world
-                    
-                    # 交点が面内にあるか確認
-                    # 簡易的なアプローチ: バリセントリック座標を使用
-                    # 2D射影を使用して単純化
-                    def is_point_in_triangle(p, v0, v1, v2):
-                        def sign(p1, p2, p3):
-                            return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
-                        
-                        d1 = sign(p, v0, v1)
-                        d2 = sign(p, v1, v2)
-                        d3 = sign(p, v2, v0)
-                        
-                        has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
-                        has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-                        
-                        return not (has_neg and has_pos)
-                    
-                    # 面を2つの三角形に分割
-                    triangles = [
-                        [world_vertices[0], world_vertices[1], world_vertices[2]],
-                        [world_vertices[0], world_vertices[2], world_vertices[3]]
-                    ]
-                    triangle_uvs = [
-                        [texture_coords[0], texture_coords[1], texture_coords[2]],
-                        [texture_coords[0], texture_coords[2], texture_coords[3]]
-                    ]
-                    
-                    # 交点のバリセントリック座標を計算
-                    def barycentric(p, v0, v1, v2):
-                        v0v1 = v1 - v0
-                        v0v2 = v2 - v0
-                        pvv0 = p - v0
-                        
-                        d00 = np.dot(v0v1, v0v1)
-                        d01 = np.dot(v0v1, v0v2)
-                        d11 = np.dot(v0v2, v0v2)
-                        d20 = np.dot(pvv0, v0v1)
-                        d21 = np.dot(pvv0, v0v2)
-                        
-                        denom = d00 * d11 - d01 * d01
-                        if abs(denom) < 1e-6:
-                            return -1, -1, -1
-                            
-                        v = (d11 * d20 - d01 * d21) / denom
-                        w = (d00 * d21 - d01 * d20) / denom
-                        u = 1.0 - v - w
-                        
-                        return u, v, w
-                    
-                    # 正確な深度計算のために、カメラ空間での交点を計算
-                    point_depth = t
-                    
-                    # すでに描画されたピクセルよりも手前にあるか確認
-                    if point_depth >= depth_buffer[y, x]:
-                        continue
-                    
-                    # 交点がどの三角形内にあるか、そしてUV座標を計算
-                    found = False
-                    u, v = 0, 0
-                    
-                    for tri_idx, (triangle, tri_uv) in enumerate(zip(triangles, triangle_uvs)):
-                        # 3Dバリセントリック座標を計算
-                        bc_u, bc_v, bc_w = barycentric(intersection, triangle[0], triangle[1], triangle[2])
-                        
-                        if bc_u >= 0 and bc_v >= 0 and bc_w >= 0:
-                            # バリセントリック座標を使ってUV座標を補間
-                            u = bc_u * tri_uv[0][0] + bc_v * tri_uv[1][0] + bc_w * tri_uv[2][0]
-                            v = bc_u * tri_uv[0][1] + bc_v * tri_uv[1][1] + bc_w * tri_uv[2][1]
-                            found = True
-                            break
-                    
-                    if not found:
-                        # 平面内だが三角形内にない場合は、単純にUV座標を計算
-                        # これは通常発生すべきではないが、数値誤差による対策
-                        p0 = np.array(world_vertices[0])
-                        p1 = np.array(world_vertices[1])
-                        p3 = np.array(world_vertices[3])
-                        
-                        # 面の座標系内での交点の位置を計算
-                        v0 = p1 - p0  # 幅方向
-                        v1 = p3 - p0  # 高さ方向
-                        
-                        # p0からの相対位置を計算
-                        rel_pos = intersection - p0
-                        
-                        # 相対位置をv0, v1の基底で表現
-                        # これは近似的な計算で、より正確にはグラム・シュミット過程などを使用
-                        proj_u = np.dot(rel_pos, v0) / np.dot(v0, v0)
-                        proj_v = np.dot(rel_pos, v1) / np.dot(v1, v1)
-                        
-                        u = max(0, min(1, proj_u))
-                        v = max(0, min(1, proj_v))
-                    
-                    # テクスチャの色を取得
-                    tx = min(int(u * texture.shape[1]), texture.shape[1] - 1)
-                    ty = min(int(v * texture.shape[0]), texture.shape[0] - 1)
-                    
-                    color = texture[ty, tx]
-                    
-                    # 深度テストと更新
-                    if point_depth < depth_buffer[y, x]:
-                        frame[y, x] = color
-                        depth_buffer[y, x] = point_depth
+            # バリセントリック座標の係数を計算
+            denom = d00 * d11 - d01 * d01
+            inv_denom = 1.0 / denom
+            
+            v = (d11 * d20 - d01 * d21) * inv_denom
+            w = (d00 * d21 - d01 * d20) * inv_denom
+            u = 1.0 - v - w
+            
+            # 三角形の内部かどうかを判断
+            mask_inside = (u >= 0) & (v >= 0) & (w >= 0)
+            
+            # 最終的なマスク
+            final_mask = torch.zeros_like(mask_process, dtype=torch.bool, device=self.device)
+            final_mask[mask_process] = mask_inside
+            
+            if not final_mask.any():
+                continue
+                
+            # 処理するピクセルだけにマスクを適用
+            intersections_flat = intersections[final_mask]
+            t_flat = t[final_mask]
+            
+            # 各ピクセルのUV座標を計算
+            uvs_flat = torch.zeros((intersections_flat.shape[0], 2), device=self.device)
+            
+            # バリセントリック座標から三角形の各頂点のUV座標を補間
+            face_idx = self.triangle_face_mapping_gpu[tri_idx]
+            face = self.faces[face_idx]
+            
+            # 三角形がどの面に属するか
+            if tri_idx % 2 == 0:  # 最初の三角形
+                uv0 = torch.tensor(self.uvs[0], device=self.device)
+                uv1 = torch.tensor(self.uvs[1], device=self.device)
+                uv2 = torch.tensor(self.uvs[2], device=self.device)
+            else:  # 2番目の三角形
+                uv0 = torch.tensor(self.uvs[0], device=self.device)
+                uv1 = torch.tensor(self.uvs[2], device=self.device)
+                uv2 = torch.tensor(self.uvs[3], device=self.device)
+            
+            # バリセントリック座標からUV座標を計算
+            u_flat = u[mask_inside]
+            v_flat = v[mask_inside]
+            w_flat = w[mask_inside]
+            
+            # UV座標の補間
+            uvs_flat = u_flat.unsqueeze(1) * uv0 + v_flat.unsqueeze(1) * uv1 + w_flat.unsqueeze(1) * uv2
+            
+            # テクスチャサンプリング
+            texture = self.textures_gpu[face_idx]
+            
+            # UV座標からテクスチャの座標を計算
+            uv_x = torch.clamp((uvs_flat[:, 0] * texture.shape[1]).long(), 0, texture.shape[1] - 1)
+            uv_y = torch.clamp((uvs_flat[:, 1] * texture.shape[0]).long(), 0, texture.shape[0] - 1)
+            
+            # テクスチャの色を取得
+            colors_flat = texture[uv_y, uv_x]
+            
+            # フレームと深度バッファを更新
+            flat_indices = torch.nonzero(final_mask)
+            
+            # 最終的な色と深度の更新
+            frame[flat_indices[:, 0], flat_indices[:, 1]] = colors_flat
+            depth_buffer[flat_indices[:, 0], flat_indices[:, 1]] = t_flat
         
-        # 深度マップを0-1の範囲に正規化
-        normalized_depth = np.zeros_like(depth_buffer)
+        # 深度マップをメートル単位の実距離に変換
+        # カメラの位置からの実際の距離に
+        actual_depth = depth_buffer.clone()
         
-        # 物体が描画されたピクセルのみを考慮
-        valid_depths = depth_buffer[depth_buffer < self.far]
+        # トーチテンソルをNumpyへ変換
+        frame_np = (frame * 255).byte().cpu().numpy()
+        depth_np = actual_depth.cpu().numpy()
         
-        if len(valid_depths) > 0:  # 有効な深度値が存在する場合
-            depth_min = np.min(valid_depths)
-            depth_max = np.max(valid_depths)
-            
-            # 最小値と最大値が同じ場合の対策
-            depth_range = max(depth_max - depth_min, 0.001)
-            
-            # 背景（最大深度の値）を処理
-            mask = depth_buffer < self.far
-            normalized_depth[mask] = (depth_buffer[mask] - depth_min) / depth_range
+        # 処理時間を計測
+        end_time = time.time()
+        print(f"レンダリング時間: {(end_time - start_time) * 1000:.2f}ms")
         
-        # 背景を最大深度に設定（背景は無限遠）
-        normalized_depth[depth_buffer >= self.far] = 1.0
-        
-        return frame, normalized_depth, camera_pos, camera_quaternion
+        return frame_np, depth_np, camera_pos, camera_quaternion
     
     def generate_sequence(self, num_frames=180, output_dir="tum_format_output"):
         """キューブの周りを周回するカメラのフレームシーケンスを生成"""
@@ -581,20 +544,28 @@ class Renderer:
         # TUM形式のデータ出力用クラスのインスタンス化
         tum_writer = TUMFormatWriter(output_dir, camera_params)
         
+        # 総処理時間を計測
+        total_start_time = time.time()
+        
         for frame_idx in range(num_frames):
             # このフレームの角度を計算
             angle = 2 * math.pi * frame_idx / num_frames
             
-            # フレームと深度マップをレンダリング
-            frame, depth_map, camera_pos, camera_quaternion = self.render_scene(angle)
+            # フレームと深度マップをレンダリング（GPU使用）
+            frame, depth_map, camera_pos, camera_quaternion = self.render_scene_gpu(angle)
             
             # TUM形式でフレーム、深度マップ、カメラ情報を出力
             tum_writer.write_frame(frame, depth_map, frame_idx, camera_pos, camera_quaternion)
             
             print(f"フレーム {frame_idx+1}/{num_frames} 生成完了")
+        
+        # 総処理時間を表示
+        total_time = time.time() - total_start_time
+        print(f"総処理時間: {total_time:.2f}秒 (平均 {total_time/num_frames:.2f}秒/フレーム)")
+        print("TUMデータセット形式でのシーケンス生成が完了しました。")
 
 
 if __name__ == "__main__":
-    renderer = Renderer(width=640, height=480, fov=60)
+    # GPU版レンダラーを使用
+    renderer = GPURenderer(width=640, height=480, fov=60)
     renderer.generate_sequence(num_frames=180)  # 180フレーム生成（1フレームあたり2度）
-    print("TUMデータセット形式でのシーケンス生成が完了しました。")
