@@ -109,7 +109,7 @@ class TUMFormatWriter:
 
 
 class GPURenderer:
-    def __init__(self, width=640, height=480, fov=60, device=None):
+    def __init__(self, width=640, height=480, fov=60, device=None, floor_texture_path=None):
         """
         初期化関数
         
@@ -118,6 +118,7 @@ class GPURenderer:
         height (int): 画像の高さ
         fov (float): 視野角（度）
         device (torch.device, optional): 使用するデバイス。指定がなければGPUが利用可能なら使用
+        floor_texture_path (str, optional): 床のテクスチャに使用する画像ファイルのパス
         """
         self.width = width
         self.height = height
@@ -148,7 +149,10 @@ class GPURenderer:
         self.projection_matrix = self._get_perspective_projection()
         
         # キューブのテクスチャを作成
-        self.create_cube_textures()
+        self.create_cube_textures(floor_texture_path)
+        
+        # シーンに複数の立方体を配置
+        self.create_scene_with_multiple_cubes()
         
         # ピクセル座標のメッシュグリッドを事前計算（GPU上）
         y_coords, x_coords = torch.meshgrid(
@@ -192,8 +196,96 @@ class GPURenderer:
             [0, 0, -1, 0]
         ], dtype=np.float32)
     
-    def create_cube_textures(self):
-        """キューブの各面に異なるテクスチャを作成"""
+    def create_scene_with_multiple_cubes(self):
+        """3x3=9個の立方体を床の上に配置したシーンを作成"""
+        # 床の頂点を定義（大きな平面）
+        floor_size = 20.0  # 床のサイズ
+        floor_y = -1.0     # 床のY座標位置
+        
+        floor_vertices = np.array([
+            [-floor_size/2, floor_y, -floor_size/2, 1.0],  # 左下奥
+            [floor_size/2, floor_y, -floor_size/2, 1.0],   # 右下奥
+            [floor_size/2, floor_y, floor_size/2, 1.0],    # 右下手前
+            [-floor_size/2, floor_y, floor_size/2, 1.0],   # 左下手前
+        ], dtype=np.float32)
+        
+        # 床のインデックス（三角形2つで1つの四角形）
+        floor_indices = np.array([
+            [0, 1, 2],  # 三角形1
+            [0, 2, 3],  # 三角形2
+        ], dtype=np.int64)
+        
+        # 床のテクスチャインデックス（最後のテクスチャを使用）
+        self.floor_texture_idx = len(self.textures) - 1
+        
+        # 立方体の配置を定義
+        cube_positions = []
+        spacing = 2.0  # 立方体間の間隔
+        
+        for row in range(3):
+            for col in range(3):
+                # 立方体の位置をグリッド状に計算
+                x = (col - 1) * spacing
+                z = (row - 1) * spacing
+                y = 0.0  # 床の上に配置
+                
+                cube_positions.append((x, y, z))
+        
+        print(f"立方体を次の位置に配置: {cube_positions}")
+        
+        # シーン全体の頂点とインデックスを構築
+        all_vertices = []
+        all_triangles = []
+        all_triangle_face_mapping = []
+        
+        # まず床の頂点を追加
+        vertex_offset = 0
+        all_vertices.extend(floor_vertices)
+        
+        # 床の三角形を追加
+        for tri in floor_indices:
+            all_triangles.append([vertex_offset + tri[0], vertex_offset + tri[1], vertex_offset + tri[2]])
+            all_triangle_face_mapping.append(self.floor_texture_idx)
+        
+        vertex_offset += len(floor_vertices)
+        
+        # 各立方体の頂点とインデックスを追加
+        for pos_idx, (x, y, z) in enumerate(cube_positions):
+            # 立方体の頂点を位置に合わせて変換
+            cube_vertices = self.vertices.copy()
+            for i in range(len(cube_vertices)):
+                cube_vertices[i][0] += x
+                cube_vertices[i][1] += y
+                cube_vertices[i][2] += z
+            
+            all_vertices.extend(cube_vertices)
+            
+            # この立方体の三角形を追加
+            for tri_idx, tri in enumerate(self.triangles):
+                # 頂点インデックスをオフセット
+                new_tri = [vertex_offset + tri[0], vertex_offset + tri[1], vertex_offset + tri[2]]
+                all_triangles.append(new_tri)
+                
+                # 面のマッピングを追加
+                face_idx = self.triangle_face_mapping[tri_idx]
+                all_triangle_face_mapping.append(face_idx)
+            
+            vertex_offset += len(cube_vertices)
+        
+        # GPU用のデータ構造を更新
+        self.scene_vertices = np.array(all_vertices, dtype=np.float32)
+        self.scene_triangles = np.array(all_triangles, dtype=np.int64)
+        self.scene_triangle_face_mapping = np.array(all_triangle_face_mapping, dtype=np.int64)
+        
+        # GPU用に変換
+        self.scene_vertices_gpu = torch.tensor(self.scene_vertices, device=self.device)
+        self.scene_triangles_gpu = torch.tensor(self.scene_triangles, device=self.device)
+        self.scene_triangle_face_mapping_gpu = torch.tensor(self.scene_triangle_face_mapping, device=self.device)
+        
+        print(f"シーン構築完了: {len(all_vertices)}頂点, {len(all_triangles)}三角形")
+    
+    def create_cube_textures(self, floor_texture_path=None):
+        """キューブの各面と床に異なるテクスチャを作成"""
         # キューブの頂点（原点中心の1x1x1）
         self.vertices = np.array([
             [-0.5, -0.5, -0.5, 1.0],  # 0
@@ -241,7 +333,7 @@ class GPURenderer:
             [0, 1]   # 左上
         ], dtype=np.float32)
         
-        # 各面に異なるテクスチャを作成（異なる色の市松模様）
+        # 立方体の各面に異なるテクスチャを作成（異なる色の市松模様）
         self.textures = []
         self.textures_gpu = []
         colors = [
@@ -259,6 +351,25 @@ class GPURenderer:
             # NumPy配列をPyTorchテンソルに変換
             texture_gpu = torch.tensor(texture, device=self.device).float() / 255.0
             self.textures_gpu.append(texture_gpu)
+        
+        # 床のテクスチャを追加
+        if floor_texture_path and os.path.exists(floor_texture_path):
+            try:
+                # 画像ファイルからテクスチャを読み込む
+                floor_texture = np.array(Image.open(floor_texture_path).resize((512, 512)))
+                print(f"床のテクスチャを読み込みました: {floor_texture_path}")
+            except Exception as e:
+                print(f"床のテクスチャ読み込みエラー: {e}")
+                # エラーの場合はデフォルトの床テクスチャを作成
+                floor_texture = self._create_checkboard_texture(512, 512, (120, 120, 120), (80, 80, 80), squares=4)
+        else:
+            # デフォルトの床テクスチャを作成
+            floor_texture = self._create_checkboard_texture(512, 512, (120, 120, 120), (80, 80, 80), squares=4)
+            print("デフォルトの床テクスチャを使用します")
+        
+        self.textures.append(floor_texture)
+        texture_gpu = torch.tensor(floor_texture, device=self.device).float() / 255.0
+        self.textures_gpu.append(texture_gpu)
     
     def _create_checkboard_texture(self, width, height, color1, color2, squares=8):
         """指定サイズの市松模様テクスチャを作成"""
@@ -319,18 +430,46 @@ class GPURenderer:
         
         return view_matrix
     
-    def render_scene_gpu(self, angle):
-        """GPUを使用してキューブの周りを周回するカメラからシーンをレンダリング"""
+    def render_scene_gpu(self, angle, vertices, triangles, triangle_face_mapping):
+        """
+        GPUを使用してシーンをレンダリング
+        
+        Parameters:
+        angle (float): カメラの回転角度
+        vertices (torch.Tensor, optional): 頂点データ。指定がなければシーン全体の頂点を使用
+        triangles (torch.Tensor, optional): 三角形の頂点インデックス。指定がなければシーン全体のデータを使用
+        triangle_face_mapping (torch.Tensor, optional): 三角形と面のマッピング。指定がなければシーン全体のデータを使用
+        
+        Returns:
+        tuple: (フレーム画像, 深度マップ, カメラ位置, カメラ四元数)
+        """
         # 処理時間の計測を開始
         start_time = time.time()
         
+        # # 引数の処理（デフォルト値の設定）
+        # if vertices is None:
+        #     vertices = self.scene_vertices_gpu
+        # elif not isinstance(vertices, torch.Tensor):
+        #     vertices = torch.tensor(vertices, device=self.device)
+            
+        # if triangles is None:
+        #     triangles = self.scene_triangles_gpu
+        # elif not isinstance(triangles, torch.Tensor):
+        #     triangles = torch.tensor(triangles, device=self.device)
+            
+        # if triangle_face_mapping is None:
+        #     triangle_face_mapping = self.scene_triangle_face_mapping_gpu
+        # elif not isinstance(triangle_face_mapping, torch.Tensor):
+        #     triangle_face_mapping = torch.tensor(triangle_face_mapping, device=self.device)
+        
         # 円上のカメラ位置を計算
-        radius = 3.0
+        radius = 8.0  # カメラの距離を増やして全体を見渡せるように
         camera_x = radius * math.sin(angle)
         camera_z = radius * math.cos(angle)
-        camera_pos = np.array([camera_x, 0, camera_z], dtype=np.float32)
+        camera_y = 2.5  # カメラの高さを調整
+        camera_pos = np.array([camera_x, camera_y, camera_z], dtype=np.float32)
         
-        # 原点（キューブの位置）を注視
+        # シーンの中心を注視
         target_pos = np.array([0, 0, 0], dtype=np.float32)
         up_vector = np.array([0, 1, 0], dtype=np.float32)
         
@@ -343,10 +482,6 @@ class GPURenderer:
         
         # カメラ回転の四元数表現を取得
         camera_quaternion = self.quaternion_from_euler(0, -angle + math.pi, 0)
-        
-        # 頂点をカメラ空間に変換
-        homogeneous_vertices = self.vertices_gpu.clone()
-        camera_space_vertices = torch.matmul(view_matrix_gpu, homogeneous_vertices.T).T
         
         # 白色背景のフレームと深度バッファを初期化
         frame = torch.ones((self.height, self.width, 3), device=self.device)
@@ -383,15 +518,15 @@ class GPURenderer:
         # カメラの位置を拡張 [height, width, 3]
         origin = torch.tensor(camera_pos, device=self.device).expand(self.height, self.width, 3)
         
-        # 面ごとに処理（近いものから遠いものへ）
-        for tri_idx in range(len(self.triangles)):
+        # シーン全体の三角形を処理
+        for tri_idx in range(len(triangles)):
             # 三角形の頂点インデックス
-            v_idx = self.triangles_gpu[tri_idx]
+            v_idx = triangles[tri_idx]
             
             # 三角形の3つの頂点
-            v0 = self.vertices_gpu[v_idx[0], :3]
-            v1 = self.vertices_gpu[v_idx[1], :3]
-            v2 = self.vertices_gpu[v_idx[2], :3]
+            v0 = vertices[v_idx[0], :3]
+            v1 = vertices[v_idx[1], :3]
+            v2 = vertices[v_idx[2], :3]
             
             # 面の法線ベクトルを計算
             normal = torch.cross(v1 - v0, v2 - v0)
@@ -475,12 +610,13 @@ class GPURenderer:
             # 各ピクセルのUV座標を計算
             uvs_flat = torch.zeros((intersections_flat.shape[0], 2), device=self.device)
             
-            # バリセントリック座標から三角形の各頂点のUV座標を補間
-            face_idx = self.triangle_face_mapping_gpu[tri_idx]
-            face = self.faces[face_idx]
+            # テクスチャのインデックスを取得
+            face_idx = triangle_face_mapping[tri_idx]
             
-            # 三角形がどの面に属するか
-            if tri_idx % 2 == 0:  # 最初の三角形
+            # 三角形がどの面に属するか判断し、適切なUV座標を計算
+            face_type = tri_idx % 2  # 0: 最初の三角形, 1: 2番目の三角形
+            
+            if face_type == 0:  # 最初の三角形
                 uv0 = torch.tensor(self.uvs[0], device=self.device)
                 uv1 = torch.tensor(self.uvs[1], device=self.device)
                 uv2 = torch.tensor(self.uvs[2], device=self.device)
@@ -499,6 +635,11 @@ class GPURenderer:
             
             # テクスチャサンプリング
             texture = self.textures_gpu[face_idx]
+            
+            # 床のテクスチャの場合、UV座標をタイリング（繰り返し）
+            if face_idx == self.floor_texture_idx:
+                uvs_flat = uvs_flat * 10  # 床のテクスチャを10x10回繰り返す
+                uvs_flat = uvs_flat - uvs_flat.floor()  # 0-1の範囲にラップ
             
             # UV座標からテクスチャの座標を計算
             uv_x = torch.clamp((uvs_flat[:, 0] * texture.shape[1]).long(), 0, texture.shape[1] - 1)
@@ -528,6 +669,7 @@ class GPURenderer:
         
         return frame_np, depth_np, camera_pos, camera_quaternion
     
+    
     def generate_sequence(self, num_frames=180, output_dir="tum_format_output"):
         """キューブの周りを周回するカメラのフレームシーケンスを生成"""
         # カメラパラメータの辞書を作成
@@ -552,7 +694,10 @@ class GPURenderer:
             angle = 2 * math.pi * frame_idx / num_frames
             
             # フレームと深度マップをレンダリング（GPU使用）
-            frame, depth_map, camera_pos, camera_quaternion = self.render_scene_gpu(angle)
+            frame, depth_map, camera_pos, camera_quaternion = self.render_scene_gpu(angle, 
+                                                                                    self.scene_vertices_gpu,
+                                                                                    self.scene_triangles_gpu,
+                                                                                    self.scene_triangle_face_mapping_gpu)
             
             # TUM形式でフレーム、深度マップ、カメラ情報を出力
             tum_writer.write_frame(frame, depth_map, frame_idx, camera_pos, camera_quaternion)
