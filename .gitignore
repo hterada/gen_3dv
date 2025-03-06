@@ -1,3 +1,4 @@
 .venv
 output
 tum_format_output
+__pycache__
