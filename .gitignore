@@ -2,3 +2,5 @@
 output
 tum_format_output
 __pycache__
+gen_my_gen2
+tum_format_output.*
