@@ -60,6 +60,53 @@ class GPURenderer:
         
         # シーンの初期化（後でセットする）
         self.scene = None
+        
+        # シェーディングパラメータの初期化
+        self.enable_shading = True  # シェーディングを有効化
+        
+        # 光源の設定
+        self.set_default_lights()
+        
+        # 材質パラメータ
+        self.ambient_strength = 0.2      # 環境光の強さ
+        self.diffuse_strength = 0.7      # 拡散反射の強さ
+        self.specular_strength = 0.3     # 鏡面反射の強さ
+        self.shininess = 32.0            # 光沢度（鏡面反射の鋭さ）
+    
+    def set_default_lights(self):
+        """デフォルトの光源を設定"""
+        # 光源位置（ワールド座標系）
+        self.light_positions = torch.tensor([
+            [8.0, 8.0, 8.0],   # 右上奥から
+            [-5.0, 7.0, 3.0],  # 左上手前から
+        ], device=self.device)
+        
+        # 光源色
+        self.light_colors = torch.tensor([
+            [1.0, 1.0, 1.0],  # 白色光
+            [0.8, 0.8, 1.0],  # 青みがかった光
+        ], device=self.device)
+        
+        # 光源強度
+        self.light_intensities = torch.tensor([
+            1.0,  # 主光源
+            0.5,  # 補助光源
+        ], device=self.device)
+    
+    def set_shading_parameters(self, ambient=0.2, diffuse=0.7, specular=0.3, shininess=32.0):
+        """
+        シェーディングパラメータを設定
+        
+        Parameters:
+        ambient (float): 環境光の強さ (0.0-1.0)
+        diffuse (float): 拡散反射の強さ (0.0-1.0)
+        specular (float): 鏡面反射の強さ (0.0-1.0)
+        shininess (float): 光沢度 (鏡面反射の鋭さ)
+        """
+        self.ambient_strength = ambient
+        self.diffuse_strength = diffuse
+        self.specular_strength = specular
+        self.shininess = shininess
     
     def _print_camera_intrinsics(self):
         """カメラの内部パラメータを表示"""
@@ -136,6 +183,66 @@ class GPURenderer:
         
         return view_matrix
     
+    def batch_phong_shading(self, points, normals, view_dirs, texture_colors):
+        """
+        バッチ処理によるPhongシェーディングモデルの照明計算
+        
+        Parameters:
+        points (torch.Tensor): 3D空間上の点群 [N, 3]
+        normals (torch.Tensor): 法線ベクトル群 [N, 3]
+        view_dirs (torch.Tensor): 視線方向ベクトル群 [N, 3]
+        texture_colors (torch.Tensor): テクスチャの色群 [N, 3]
+        
+        Returns:
+        torch.Tensor: 照明計算後の色群 [N, 3]
+        """
+        # 法線と視線方向の正規化
+        normals = torch.nn.functional.normalize(normals, dim=1)
+        view_dirs = torch.nn.functional.normalize(view_dirs, dim=1)
+        
+        # 環境光成分
+        ambient = self.ambient_strength * texture_colors
+        
+        # 初期色（環境光）
+        colors = ambient.clone()
+        
+        # 各光源からの寄与を計算
+        for i in range(len(self.light_positions)):
+            light_pos = self.light_positions[i]
+            light_color = self.light_colors[i]
+            light_intensity = self.light_intensities[i]
+            
+            # 光源方向ベクトル [N, 3]
+            light_dirs = light_pos.unsqueeze(0) - points
+            light_dirs = torch.nn.functional.normalize(light_dirs, dim=1)
+            
+            # 拡散反射成分（ランバート反射）
+            # dot product [N]
+            dots = torch.sum(normals * light_dirs, dim=1).clamp(min=0.0)
+            
+            # [N, 3] = [N, 1] * [1, 3] * [N, 3]
+            diffuse = self.diffuse_strength * dots.unsqueeze(1) * light_color.unsqueeze(0) * texture_colors
+            
+            # 鏡面反射成分
+            # [N, 3] = 2 * [N, 1] * [N, 3] - [N, 3]
+            reflect_dirs = 2 * torch.sum(normals * light_dirs, dim=1).unsqueeze(1) * normals - light_dirs
+            reflect_dirs = torch.nn.functional.normalize(reflect_dirs, dim=1)
+            
+            # [N] = sum([N, 3] * [N, 3], dim=1)
+            specs = torch.sum(view_dirs * reflect_dirs, dim=1).clamp(min=0.0)
+            specs = specs.pow(self.shininess)
+            
+            # [N, 3] = [N, 1] * [1, 3]
+            specular = self.specular_strength * specs.unsqueeze(1) * light_color.unsqueeze(0)
+            
+            # 光源強度を考慮して各成分を加算
+            colors += (diffuse + specular) * light_intensity
+        
+        # 値を0-1に制限
+        colors = torch.clamp(colors, 0.0, 1.0)
+        
+        return colors
+    
     def render_scene_gpu(self, angle, vertices=None, triangles=None, triangle_face_mapping=None, textures_gpu=None, floor_texture_idx=None):
         """
         GPUを使用してシーンをレンダリング
@@ -187,6 +294,9 @@ class GPURenderer:
         # カメラ回転の四元数表現を取得
         camera_quaternion = self.quaternion_from_euler(0, -angle + math.pi, 0)
         
+        # カメラ位置をGPUテンソルに変換
+        camera_pos_gpu = torch.tensor(camera_pos, device=self.device)
+        
         # 白色背景のフレームと深度バッファを初期化
         frame = torch.ones((self.height, self.width, 3), device=self.device)
         depth_buffer = torch.ones((self.height, self.width), device=self.device) * self.far
@@ -220,10 +330,13 @@ class GPURenderer:
         ray_world_norm = torch.nn.functional.normalize(ray_world, dim=-1)
         
         # カメラの位置を拡張 [height, width, 3]
-        origin = torch.tensor(camera_pos, device=self.device).expand(self.height, self.width, 3)
+        origin = camera_pos_gpu.expand(self.height, self.width, 3)
+        
+        # 計算用の一時バッファを再利用するためのリスト
+        scene_order = list(range(len(triangles)))
         
         # シーン全体の三角形を処理
-        for tri_idx in range(len(triangles)):
+        for tri_idx in scene_order:
             # 三角形の頂点インデックス
             v_idx = triangles[tri_idx]
             
@@ -271,6 +384,7 @@ class GPURenderer:
             # バリセントリック座標を計算
             # 効率化：マスクを適用したテンソルで計算
             masked_intersections = intersections[mask_process]
+            masked_ray_dirs = ray_world_norm[mask_process]
             
             # 三角形の頂点をGPUテンソルに変換
             edge1 = v1 - v0
@@ -308,8 +422,10 @@ class GPURenderer:
                 continue
                 
             # 処理するピクセルだけにマスクを適用
+            final_indices = torch.nonzero(final_mask)
             intersections_flat = intersections[final_mask]
             t_flat = t[final_mask]
+            ray_dirs_flat = -ray_world_norm[final_mask]  # 視線方向（レイの逆方向）
             
             # 各ピクセルのUV座標を計算
             uvs_flat = torch.zeros((intersections_flat.shape[0], 2), device=self.device)
@@ -353,14 +469,27 @@ class GPURenderer:
             uv_y = torch.clamp((uvs_flat[:, 1] * texture.shape[0]).long(), 0, texture.shape[0] - 1)
             
             # テクスチャの色を取得
-            colors_flat = texture[uv_y, uv_x]
+            texture_colors = texture[uv_y, uv_x]
             
-            # フレームと深度バッファを更新
-            flat_indices = torch.nonzero(final_mask)
+            # シェーディングを適用
+            if self.enable_shading:
+                # 各ピクセルに法線を割り当て
+                normals_flat = normal.expand(intersections_flat.shape[0], 3)
+                
+                # バッチ処理でシェーディング計算（高速化）
+                colors_flat = self.batch_phong_shading(
+                    intersections_flat,
+                    normals_flat,
+                    ray_dirs_flat,
+                    texture_colors
+                )
+            else:
+                # シェーディングなし（テクスチャの色をそのまま使用）
+                colors_flat = texture_colors
             
             # 最終的な色と深度の更新
-            frame[flat_indices[:, 0], flat_indices[:, 1]] = colors_flat
-            depth_buffer[flat_indices[:, 0], flat_indices[:, 1]] = t_flat
+            frame[final_indices[:, 0], final_indices[:, 1]] = colors_flat
+            depth_buffer[final_indices[:, 0], final_indices[:, 1]] = t_flat
         
         # 深度マップをメートル単位の実距離に変換
         # カメラの位置からの実際の距離に

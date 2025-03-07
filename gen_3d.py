@@ -21,6 +21,12 @@ def main():
     parser.add_argument("--rows", type=int, default=3, help="立方体の行数")
     parser.add_argument("--cols", type=int, default=3, help="立方体の列数")
     parser.add_argument("--spacing", type=float, default=2.0, help="立方体間の間隔")
+    parser.add_argument("--shading", action="store_true", default=True, help="シェーディングを有効にする")
+    parser.add_argument("--ambient", type=float, default=0.2, help="環境光の強さ (0.0-1.0)")
+    parser.add_argument("--diffuse", type=float, default=0.7, help="拡散反射の強さ (0.0-1.0)")
+    parser.add_argument("--specular", type=float, default=0.3, help="鏡面反射の強さ (0.0-1.0)")
+    parser.add_argument("--shininess", type=float, default=32.0, help="光沢度（鏡面反射の鋭さ）")
+    parser.add_argument("--no-shading", dest="shading", action="store_false", help="シェーディングを無効にする")
     
     args = parser.parse_args()
     
@@ -30,6 +36,20 @@ def main():
         height=args.height, 
         fov=args.fov
     )
+    
+    # シェーディングの設定
+    renderer.enable_shading = args.shading
+    if args.shading:
+        renderer.set_shading_parameters(
+            ambient=args.ambient,
+            diffuse=args.diffuse,
+            specular=args.specular,
+            shininess=args.shininess
+        )
+        print(f"シェーディングを有効化: ambient={args.ambient}, diffuse={args.diffuse}, "
+              f"specular={args.specular}, shininess={args.shininess}")
+    else:
+        print("シェーディングを無効化")
     
     # シーンを作成
     scene = Scene(device=renderer.device)
